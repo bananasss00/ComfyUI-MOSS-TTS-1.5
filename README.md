@@ -38,7 +38,7 @@ Which model? Start with the default (Local-Transformer). Take the **8B** if you 
 
 - A CUDA GPU with **~12 GB VRAM** for the default Local-Transformer, **~22 GB** for the 8B.
 - Disk space for the first download: **~9 GB** model + **~8.5 GB** audio tokenizer (default), or **~17 GB + ~7 GB** (8B) — nothing if you already have them, see [Using a model you already downloaded](#using-a-model-you-already-downloaded).
-- `transformers`, `torch`, `torchaudio` — whatever your ComfyUI already has. The default model runs on transformers 4.x and 5.x; **the 8B needs 5.x** (the loader tells you if yours is too old). **Avoid transformers 5.4.0 and 5.5.0** — they cannot read MOSS's audio tokenizer, see [below](#known-install-gotcha--configuration_moss_audio_tokenizerpy-dataclass-ordering).
+- `torch`, `torchaudio` — whatever your ComfyUI already has. **transformers is not your problem anymore**: from 0.6.5 the pack brings its own, isolated from the rest of ComfyUI — see [Isolated transformers (vendored)](#isolated-transformers-vendored). The default model also runs on a shared transformers 4.x or 5.x; **the 8B needs 5.x**; **avoid a shared transformers 5.4.0 / 5.5.0** — they cannot read MOSS's audio tokenizer, see [below](#known-install-gotcha--configuration_moss_audio_tokenizerpy-dataclass-ordering).
 
 Nothing else: no `flash-attn` (optional, see below), no `torchcodec`, no custom kernels.
 
@@ -54,6 +54,25 @@ git clone https://github.com/eehrich/ComfyUI-MOSS-TTS-1.5.git
 ```
 
 Restart ComfyUI. The first run of `MOSS-TTS Load Model` downloads the selected model into your Hugging Face cache.
+
+### Isolated transformers (vendored)
+
+ComfyUI's Python environment holds **one** shared `transformers` for every custom node — and packs disagree about which version it should be. Upgrading it for MOSS can break another pack; staying on 4.x breaks the 8B here. So from **0.6.5** this pack stops playing that zero-sum game: on first load it pip-installs **its own transformers ≥ 5.5.1** (plus `huggingface_hub`, `hf_xet`) into the pack's `vendor/` folder —
+
+```bash
+python -m pip install --target <this pack>/vendor --upgrade --no-deps "transformers>=5.5.1" huggingface_hub hf_xet
+```
+
+— and **while a MOSS node runs**, that copy temporarily replaces the shared one in `sys.modules` (see `vendor_context.py`; the mechanism is modelled on Higgs_v3-TTS-ComfyUI's `vendored_transformers` branch). When the node returns, the shared environment is exactly as it was:
+
+- **Your ComfyUI-wide `transformers` is never upgraded, downgraded or otherwise touched.** Nothing is installed into `site-packages`; other packs keep the version they want.
+- **`torch` and `torchaudio` stay shared** (one torch per process — swapping native extensions would crash the interpreter).
+- **`tokenizers` / `safetensors` are shared *when possible*.** If the shared copies already satisfy the vendored transformers' requirements, nothing is done. If they are too old for it (e.g. a shared transformers 4.x needs `tokenizers<=0.23.0` while transformers 5.x needs `>=0.23.1,<0.24.0` — no version satisfies both), the pack pip-installs its **own** copies into `vendor/` instead of upgrading anything shared — those join the same temporary swap while a MOSS node runs, and your ComfyUI-wide versions stay exactly as they are. From **0.6.6**.
+- The swap happens on every MOSS node execution, not at ComfyUI start, so it cannot disturb other packs' model loading or their already-loaded models.
+- The one-time `vendor/` install needs network. It is skipped on every later start (a `.ready` marker records the completed setup; an older `vendor/` is migrated automatically, no manual deletion needed). Offline first start? The pack falls back to the shared transformers — the Local-Transformer works there on 4.x and 5.x, the 8B only on ≥ 5.5.1 (the loader says so if not).
+- `vendor/` is gitignored and machine-local; deleting it and restarting ComfyUI re-creates it.
+
+To pre-install before going offline, run the pack's `install.py` with ComfyUI's Python — it does the same `vendor/` install plus a dependency sanity check.
 
 ### Using a model you already downloaded
 
@@ -112,13 +131,13 @@ Nothing to configure. If yours lives somewhere else, point the loader's `tokeniz
 
 ### Known install gotcha — `configuration_moss_audio_tokenizer.py` dataclass ordering
 
-Only with transformers **5.4.0 or 5.5.0**: loading fails with
+Only with transformers **5.4.0 or 5.5.0** — which the pack's own isolated copy never is (it pins ≥ 5.5.1). You can only hit this on a **shared** transformers, i.e. when the vendored install is missing (offline first start) — loading fails with
 
 ```
 TypeError: non-default argument 'sampling_rate' follows default argument 'problem_type'
 ```
 
-(or the loader's own message saying the same). Fix: upgrade transformers in ComfyUI's Python environment —
+(or the loader's own message saying the same). Fix: restart ComfyUI once with network access so the pack's isolated transformers ≥ 5.5.1 lands in its `vendor/` folder (see [Isolated transformers (vendored)](#isolated-transformers-vendored)) — or upgrade the shared one in ComfyUI's Python environment —
 
 ```bash
 python -m pip install -U "transformers>=5.5.1"
@@ -637,8 +656,10 @@ VRAM: ~12 GB for the default model, ~22 GB for the 8B. Very long texts or refere
 
 - **Output is gibberish — `previous_text` does not match the previous audio.** Usually a shortened clip or token window whose text was left at full length, or the wrong paragraph. Listen to the prefix with `Decode Tokens` and read `previous_text` next to it. See [Reference rules](#reference-rules).
 - **Output is gibberish — the reference is too short.** Below ~10 s MOSS cannot lock onto the voice; use 10–20 s.
-- **`AttributeError: module 'transformers.processing_utils' has no attribute 'MODALITY_TO_BASE_CLASS_MAPPING'` (suggests `AUTO_TO_BASE_CLASS_MAPPING`)**: you are on transformers 4.x and loading a model whose code needs 5.x — the **8B** always, the Local-Transformer only in an old cached build. Upgrade transformers in ComfyUI's Python env: `python -m pip install -U "transformers>=5.5.1"` (needs Python 3.10+). The loader's own error message prints the same command.
-- **`TypeError: non-default argument 'sampling_rate' follows default argument …`**: transformers 5.4.0 or 5.5.0 — upgrade as above, or see [the install gotcha](#known-install-gotcha--configuration_moss_audio_tokenizerpy-dataclass-ordering).
+- **`TypeError: Unexpected keyword argument revision.`** (in `processing_utils.py`, right after "loading processor …"): the processor's remote code was written for transformers 4.x, which silently accepted the `revision` kwarg that transformers 5.x injects into every `AutoProcessor.from_pretrained` call — 5.x made that constructor strict. Fixed in **0.6.7** inside the pack's isolated transformers. If you still see it, you are running an older copy of the pack: update it (or delete the pack's `vendor/` folder and restart ComfyUI once with network access so the isolated copy is rebuilt with the fix).
+- **`ImportError: tokenizers>=0.23.1,<0.24.0 is required …, but found tokenizers==0.22.2`**: the shared `tokenizers` is too old for transformers 5.x (and upgrading it would break the shared transformers 4.x — the version ranges do not overlap). Fixed in **0.6.6**: the pack vendors its own `tokenizers`/`safetensors` into `vendor/` instead of touching anything shared. If you still see it, update the pack (or delete its `vendor/` folder and restart ComfyUI once with network access).
+- **`AttributeError: module 'transformers.processing_utils' has no attribute 'MODALITY_TO_BASE_CLASS_MAPPING'` (suggests `AUTO_TO_BASE_CLASS_MAPPING`)**: the transformers in use is 4.x and the model's code needs 5.x — the **8B** always, the Local-Transformer only in an old cached build. This pack normally runs its **own** transformers ≥ 5.5.1 from `vendor/`, so reaching this message means that isolated install is missing (offline first start?) and the shared one is being used: restart ComfyUI once with network access, or upgrade the shared transformers (`python -m pip install -U "transformers>=5.5.1"`, needs Python 3.10+). See [Isolated transformers (vendored)](#isolated-transformers-vendored). The loader's own error message says the same.
+- **`TypeError: non-default argument 'sampling_rate' follows default argument …`**: the transformers in use is 5.4.0 or 5.5.0 — the pack's isolated copy never is, so this only happens on a missing-vendor fallback: restart with network access as above, or see [the install gotcha](#known-install-gotcha--configuration_moss_audio_tokenizerpy-dataclass-ordering).
 - **Voice Continue shows odd values after an update (e.g. `audio_repetition_penalty` below its minimum, `text_top_k` = 1, `prefix_tail_trim_frames` = 50)**: only workflows saved with a 0.6.1–0.6.3 test build of this pack are affected; workflows from the regular 0.5.x releases load unchanged. Re-enter that node's values once, or replace the node.
 - **`Can't load the model … pytorch_model.bin`**: your model.safetensors download stalled. Re-run `huggingface_hub.hf_hub_download(repo_id=..., filename=...)` for the file that stalled — `model.safetensors` for the Local-Transformer, one of the `model-0000N-of-00004.safetensors` shards for the 8B. Often caused by low disk space in `~/.cache/huggingface`.
 - **`std::bad_alloc` on `import torchcodec`**: your installed `torchcodec` version was compiled against a different torch. Either install the torchcodec version that matches your torch (see [torchcodec's compatibility table](https://github.com/pytorch/torchcodec#installing-torchcodec)) or `pip uninstall torchcodec`. The MOSS pipeline itself does **not** require torchcodec.

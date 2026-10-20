@@ -7,5 +7,8 @@ __pycache__/
 *.mp3
 *.safetensors
 
+# the pack's isolated transformers, pip-installed on first load (vendor_context.py)
+vendor/
+
 # comfy-cli publish artifact
 node.zip

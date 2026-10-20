@@ -35,17 +35,35 @@ call (~24 s at concurrency 8 on a 5090) while generation itself scales fine.
 
 from __future__ import annotations
 
+import functools
 import gc
 import inspect
 import json
 import logging
 import math
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import torch
 import torchaudio
+
+try:
+    from .vendor_context import vendored_transformers
+except ImportError:
+    # The pack's own self-checks (tests/) load this file by PATH -- a bare
+    # module with no package parent -- so the relative import above fails
+    # there. Load the sibling vendor_context.py the same way instead; inside
+    # ComfyUI (the pack imported as a package) this branch never runs.
+    import importlib.util as _ilu
+
+    _vc_spec = _ilu.spec_from_file_location(
+        "vendor_context", Path(__file__).resolve().with_name("vendor_context.py"))
+    _vendor_context = _ilu.module_from_spec(_vc_spec)
+    sys.modules["vendor_context"] = _vendor_context
+    _vc_spec.loader.exec_module(_vendor_context)
+    vendored_transformers = _vendor_context.vendored_transformers
 
 logger = logging.getLogger("MOSS-TTS-ComfyUI")
 
@@ -631,8 +649,14 @@ def _load_bundle(model_id: str, device: str, attention: str = "auto",
             raise RuntimeError(
                 f"This MOSS-TTS v1.5 model build needs transformers >= 5.0 (it "
                 f"uses processing_utils.MODALITY_TO_BASE_CLASS_MAPPING, added in "
-                f"5.0.0); you have transformers {tv} on Python {py}. Upgrade in "
-                f"your ComfyUI Python environment:\n"
+                f"5.0.0); the transformers in use is {tv} on Python {py}. This pack "
+                f"normally shields you from that: on first start it pip-installs "
+                f"its own transformers >= 5.5.1 into the pack's vendor/ folder and "
+                f"runs nodes against that copy. Reaching this message means the "
+                f"vendored copy is missing (offline first start? failed install? "
+                f"vendor/ deleted?) and the ComfyUI-wide transformers is being "
+                f"used. Restart ComfyUI once with network access to retry the "
+                f"vendored install, or upgrade the shared one:\n"
                 f"    python -m pip install -U \"transformers>=5.5.1\""
             ) from e
         raise
@@ -645,8 +669,12 @@ def _load_bundle(model_id: str, device: str, attention: str = "auto",
         import transformers
         raise RuntimeError(
             f"transformers {getattr(transformers, '__version__', '?')} cannot read the MOSS "
-            f"audio tokenizer's config ({e}). Only 5.4.0 and 5.5.0 are affected; upgrade in "
-            f"your ComfyUI Python environment:\n"
+            f"audio tokenizer's config ({e}). Only 5.4.0 and 5.5.0 are affected. This pack "
+            f"normally shields you from that by running its own transformers >= 5.5.1 from "
+            f"the pack's vendor/ folder; reaching this message means that vendored copy is "
+            f"missing (offline first start? failed install? vendor/ deleted?) and the "
+            f"ComfyUI-wide transformers is being used instead. Restart ComfyUI once with "
+            f"network access to retry the vendored install, or upgrade the shared one:\n"
             f"    python -m pip install -U \"transformers>=5.5.1\""
         ) from e
     processor.audio_tokenizer = processor.audio_tokenizer.to(device)
@@ -674,6 +702,37 @@ def _load_bundle(model_id: str, device: str, attention: str = "auto",
     }
     _MODEL_CACHE[key] = bundle
     return bundle
+
+
+def _with_vendored_transformers(method):
+    """Run a node method with the pack's isolated transformers swapped in.
+
+    Every node whose body can load a model or touch the processor runs inside
+    this context. Two reasons it must wrap the WHOLE method, not just the
+    from_pretrained call:
+
+    * the model bundle may load lazily -- _live_bundle() re-runs _load_bundle
+      on a released bundle right in the middle of a generate/encode/decode
+      call;
+    * MOSS's remote code (processing_moss_tts.py & co) lazy-imports
+      `transformers` from deep inside processor calls and model.generate(),
+      and those imports must resolve to the SAME module family the bundle was
+      built from -- not to whatever the shared environment has loaded at that
+      moment.
+
+    The swap lasts exactly as long as the method (see vendor_context.py);
+    torch, torchaudio and the Rust tokenizers extension stay shared, so a
+    run costs nothing beyond the first. Method-level wrapping mirrors
+    Higgs_v3-TTS-ComfyUI's vendored_transformers branch, which this pack's
+    isolation is modelled on.
+    """
+
+    @functools.wraps(method)
+    def wrapper(*args, **kwargs):
+        with vendored_transformers():
+            return method(*args, **kwargs)
+
+    return wrapper
 
 
 class MOSSLoadModel:
@@ -804,6 +863,7 @@ class MOSSLoadModel:
     FUNCTION = "load"
     CATEGORY = "MOSS TTS 1.5"
 
+    @_with_vendored_transformers
     def load(self, model_id: str, device: str, attention: str = "auto",
              model_path: str = "", tokenizer_path: str = ""):
         if device == "cuda" and not torch.cuda.is_available():
@@ -1604,6 +1664,7 @@ class MOSSSpeak:
     FUNCTION = "generate"
     CATEGORY = "MOSS TTS 1.5"
 
+    @_with_vendored_transformers
     def generate(
         self,
         moss_model: dict[str, Any],
@@ -1877,6 +1938,7 @@ class MOSSVoiceClone:
     FUNCTION = "generate"
     CATEGORY = "MOSS TTS 1.5"
 
+    @_with_vendored_transformers
     def generate(
         self,
         moss_model: dict[str, Any],
@@ -2261,6 +2323,7 @@ class MOSSVoiceContinue:
     FUNCTION = "generate"
     CATEGORY = "MOSS TTS 1.5"
 
+    @_with_vendored_transformers
     def generate(
         self,
         moss_model: dict[str, Any],
@@ -2508,6 +2571,7 @@ class MOSSEncodeTokens:
     FUNCTION = "encode"
     CATEGORY = "MOSS TTS 1.5"
 
+    @_with_vendored_transformers
     def encode(self, moss_model: dict[str, Any], audio: dict[str, Any]) -> tuple[torch.Tensor, int]:
         moss_model = _live_bundle(moss_model)
         processor = moss_model["processor"]
@@ -2597,6 +2661,7 @@ class MOSSDecodeTokens:
     FUNCTION = "decode"
     CATEGORY = "MOSS TTS 1.5"
 
+    @_with_vendored_transformers
     def decode(
         self,
         moss_model: dict[str, Any],
